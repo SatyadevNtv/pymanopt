@@ -4,6 +4,7 @@ import numpy as np
 from numpy import linalg as la, random as rnd
 from scipy.linalg import expm
 from scipy.sparse.linalg import LinearOperator, cg
+import scipy
 # Workaround for SciPy bug: https://github.com/scipy/scipy/pull/8082
 try:
     from scipy.linalg import solve_continuous_lyapunov as lyap
@@ -12,6 +13,8 @@ except ImportError:
 
 from pymanopt.manifolds.manifold import Manifold
 from pymanopt.tools.multi import multilog, multiprod, multisym, multitransp
+
+import sparse
 
 import time
 from IPython import embed
@@ -35,20 +38,28 @@ def SKnopp(A, p, q, maxiters=None, checkperiod=None):
 
 
     C = A
-
     iters = 0
     d1 = q / np.sum(A, axis=1)
-    #d2 = p / np.einsum('bnm,bm->bn', C, d1.conj())
-    d2 = p / np.tensordot(C, d1.conj(), axes=[2, 1])[:, :, 0]
+    if hasattr(d1, 'fill_value'):
+        d1.fill_value = np.float64(0)
+    d2 = p / np.sum(C * d1[:, np.newaxis, :], axis=2)
+    if hasattr(d1, 'fill_value'):
+        d2.fill_value = np.float64(0)
 
     gap = np.inf
 
+
     while iters < maxiters:
-        #row = np.einsum('bn,bnm->bm', d2, C)
-        row = np.tensordot(d2, C, axes=[1, 1])[0]
+        row = np.sum(C * d2[:, :, np.newaxis], axis=1)
 
         if iters % checkperiod == 0:
-            gap = np.max(np.absolute(row * d1 - q))
+            try:
+                if hasattr(row, 'multiply') or hasattr(d1, 'multiply'):
+                    gap = np.max(np.absolute(d1.multiply(row) - q))
+                else:
+                    gap = np.max(np.absolute(row * d1 - q))
+            except ValueError as e:
+                embed()
             if np.any(np.isnan(gap)) or gap <= tol:
                 break
         iters += 1
@@ -56,8 +67,11 @@ def SKnopp(A, p, q, maxiters=None, checkperiod=None):
         d1_prev = d1
         d2_prev = d2
         d1 = q / row
-        #d2 = p / np.einsum('bnm,bm->bn', C, d1.conj())
-        d2 = p / np.tensordot(C, d1.conj(), axes=[2, 1])[:, :, 0]
+        if hasattr(d1, 'fill_value'):
+            d1.fill_value = np.float64(0)
+        d2 = p / np.sum(C * d1[:, np.newaxis, :], axis=2)
+        if hasattr(d1, 'fill_value'):
+            d2.fill_value = np.float64(0)
 
         if np.any(np.isnan(d1)) or np.any(np.isinf(d1)) or np.any(np.isnan(d2)) or np.any(np.isinf(d2)):
             warnings.warn("""SKnopp: NanInfEncountered
@@ -67,7 +81,6 @@ def SKnopp(A, p, q, maxiters=None, checkperiod=None):
             break
 
     _rhs_ = np.matmul(d2[:, :, np.newaxis], d1[:, np.newaxis, :])
-    #result = C * (np.einsum('bn,bm->bnm', d2, d1))
     result = C * _rhs_
     return result
 
@@ -95,15 +108,25 @@ class DoublyStochastic(Manifold):
             self._q = self._q[np.newaxis, :]
 
 
-        # TODO: assert the the max_m, max_n (nonzeros) match (m, n)
         if maxSKnoppIters is None:
             self._maxSKnoppIters = min(2000, 100 + m + n)
 
-        self._name = ("{:d}X{:d} matrices with positive entries such that row sum is p and column sum is q".format(n, m))
-        # TODO: Make it appropriate
-        self._dim = (n - 1)*(m - 1)
-        self._e1 = np.ones(n)
-        self._e2 = np.ones(m)
+        # `k` doublystochastic manifolds
+        self._k = self._p.shape[0]
+
+        self._name = ("{:d} {:d}X{:d} (max) matrices with positive entries such that row sum is p and column sum is q".format(self._k, n, m))
+
+        self._dim = 0
+        for i in range(self._k):
+            self._dim += (self._p[i].nnz - 1) * (self._q[i].nnz - 1)
+
+        self._e1 = scipy.sparse.csr_matrix(np.zeros((self._k, n)))
+        self._e2 = scipy.sparse.csr_matrix(np.zeros((self._k, m)))
+        for i in range(self._k):
+            nnz_p = self._p[i].nnz
+            nnz_q = self._q[i].nnz
+            self._e1[i, :nnz_p] = np.ones(nnz_p)
+            self._e2[i, :nnz_q] = np.ones(nnz_q)
 
 
     def __str__(self):
@@ -117,68 +140,105 @@ class DoublyStochastic(Manifold):
 
     @property
     def typicaldist(self):
-        # TODO:
-        return self._m + self._n
+        result = 0
+        for i in range(self._k):
+            result += (self._p[i].nnz + self._q[i].nnz)**2
+        return np.sqrt(result)
 
 
     def inner(self, x, u, v):
-        # TODO:
-        return np.sum(u*v/x)
+        result = u*v/x
+        result.fill_value = np.float64(0)
+        return np.sum(result)
 
 
     def norm(self, x, u):
-        # TODO:
         return np.sqrt(self.inner(x, u, u))
 
 
+    def __prep_nd_sparse(self,):
+        coords = [[], [], []]
+        data = []
+        for i in range(0, self._k):
+            A0 = np.absolute(rnd.rand(self._p[i].nnz, self._q[i].nnz))
+            A0 = A0[np.newaxis, :]
+            nz = A0.nonzero()
+            nz_val = A0[nz]
+            coords[0] = coords[0] + (nz[0] + i).tolist()
+            coords[1] = coords[1] + (nz[1]).tolist()
+            coords[2] = coords[2] + (nz[2]).tolist()
+            data += nz_val.tolist()
+        result = sparse.COO(coords=coords, data=data, shape=(self._k, self._n, self._m))
+        return result
+
+
     def rand(self):
-        # TODO:
-        Z = np.absolute(rnd.randn(self._n, self._m))
-        return SKnopp(Z, self._p, self._q, self._maxSKnoppIters)
+        Z = self.__prep_nd_sparse()
+        result = SKnopp(Z, self._p, self._q, self._maxSKnoppIters)
+        return result
 
 
     def randvec(self, x):
-        # TODO:
-        Z = rnd.randn(self._n, self._m)
+        Z = self.__prep_nd_sparse()
         Zproj = self.proj(x, Z)
         return Zproj / self.norm(x, Zproj)
 
 
     def _matvec(self, v):
-        # TODO:
-        batch = int(self.X.shape[0])
-        v = v.reshape(batch, int(v.shape[0]/batch))
-        vtop = v[:, :self._n]
-        vbottom = v[:, self._n:]
-        #Avtop = (vtop * self._p) + np.einsum('bnm,bm->bn', self.X, vbottom)
-        Avtop = (vtop * self._p) + np.tensordot(self.X, vbottom, axes=[2,1])[:, :, 0]
-        #Avbottom = np.einsum('bnm,bn->bm', self.X, vtop) + (vbottom * self._q)
-        Avbottom = np.tensordot(self.X, vtop, axes=[1,1])[:, :, 0] + (vbottom * self._q)
-        Av = np.hstack((Avtop, Avbottom))
-        return Av.ravel()
+        if sparse.COO(v).nnz == 0:
+            return np.zeros(v.shape[0])
+
+        vtop = scipy.sparse.csr_matrix(np.zeros((self._k, self._n)))
+        vbottom = scipy.sparse.csr_matrix(np.zeros((self._k, self._m)))
+        start_idx = 0
+        for i in range(self._k):
+            nnz_top = self._p[i].nnz
+            nnz_bottom = self._q[i].nnz
+            vtop[i, :nnz_top] = v[start_idx:start_idx+nnz_top]
+            vbottom[i, :nnz_bottom] = v[start_idx+nnz_top:start_idx+nnz_top+nnz_bottom]
+            start_idx += nnz_top+nnz_bottom
+
+        Avtop = self._p.multiply(vtop) + np.sum(self.X * sparse.COO.from_scipy_sparse(vbottom)[:, np.newaxis, :], axis=2)
+        Avbottom = np.sum(self.X * sparse.COO.from_scipy_sparse(vtop)[:, :, np.newaxis], axis=1) + self._q.multiply(vbottom)
+        if np.any(np.isnan(Avtop)) or np.any(np.isnan(Avbottom)) or np.any(np.isinf(Avtop)) or np.any(np.isinf(Avbottom)):
+            embed()
+        result = np.array([])
+        for i in range(self._k):
+            result = np.concatenate((result, Avtop[i].data, Avbottom[i].data))
+        return result
 
 
     def _lsolve(self, x, b):
-        # TODO:
         self.X = x.copy()
-        batch = x.shape[0]
-        _dim = batch * (self._n + self._m)
-        shape = (_dim, _dim)
+        shape = (len(b), len(b))
         sol, _iters = cg(LinearOperator(shape, matvec=self._matvec), b, tol=1e-6, maxiter=100)
-        sol = sol.reshape(batch, int(sol.shape[0]/batch))
+        if np.any(np.isnan(sol)):
+            embed()
         del self.X
-        alpha, beta = sol[:, :self._n], sol[:, self._n:]
+        start_idx = 0
+        alpha = scipy.sparse.csr_matrix(np.zeros((self._k, self._n)))
+        beta = scipy.sparse.csr_matrix(np.zeros((self._k, self._m)))
+        for i in range(self._k):
+            nnz_top = self._p[i].nnz
+            nnz_bottom = self._q[i].nnz
+            alpha[i, :nnz_top] = sol[start_idx:start_idx+nnz_top]
+            beta[i, :nnz_bottom] = sol[start_idx+nnz_top:start_idx+nnz_top+nnz_bottom]
+            start_idx += nnz_top+nnz_bottom
         return alpha, beta
 
 
 
     def proj(self, x, v):
-        # TODO: Reverify this
-        b = np.hstack((np.sum(v, axis=2), np.sum(v, axis=1)))
-        alpha, beta = self._lsolve(x, b.ravel())
-        #result = v - (np.einsum('bn,m->bnm', alpha, self._e2) + np.einsum('n,bm->bnm', self._e1, beta))*x
-        result = v - (np.matmul(alpha[:,:,np.newaxis], self._e2[np.newaxis, :]) + \
-                      np.matmul(self._e1[:, np.newaxis], beta[:, np.newaxis, :]))*x
+        b = []
+        b_n = np.sum(v, axis=2)
+        b_m = np.sum(v, axis=1)
+        for i in range(self._k):
+            b += b_n[i].data.tolist() + b_m[i].data.tolist()
+        alpha, beta = self._lsolve(x, np.array(b))
+        result = v - (np.matmul(sparse.COO.from_scipy_sparse(alpha)[:,:,np.newaxis], sparse.COO.from_scipy_sparse(self._e2)[:, np.newaxis, :]) + \
+                      np.matmul(sparse.COO.from_scipy_sparse(self._e1)[:, :, np.newaxis], sparse.COO.from_scipy_sparse(beta)[:, np.newaxis, :]))*x
+        if np.any(np.isnan(result)):
+            embed()
         return result
 
 
@@ -187,13 +247,13 @@ class DoublyStochastic(Manifold):
 
 
     def egrad2rgrad(self, x, u):
-        # TODO:
         mu = x * u
         return self.proj(x, mu)
 
 
     def ehess2rhess(self, x, egrad, ehess, u):
         # TODO:
+        raise RuntimeError
         gamma = egrad * x
         gamma_dot = (ehess * x) + (egrad * u)
 
@@ -221,25 +281,20 @@ class DoublyStochastic(Manifold):
 
 
     def retr(self, x, u):
-        # TODO:
-        #print(f"Retraction called ...")
-        start_time = time.time()
         Y = x * np.exp(u/x)
-        Y = np.maximum(Y, 1e-50)
-        Y = np.minimum(Y, 1e50)
+        Y.fill_value = np.float64(0)
+        #Y = np.maximum(Y, 1e-50)
+        #Y = np.minimum(Y, 1e50)
         res = SKnopp(Y, self._p, self._q, self._maxSKnoppIters)
-        end_time = time.time()
-        #print(f"Retraction time -> {end_time - start_time}")
         return res
 
 
     def zerovec(self, x):
-        # TODO:
+        raise RuntimeError
         return np.zeros((self._n, self._m))
 
 
     def transp(self, x1, x2, d):
-        # TODO:
         return self.proj(x2, d)
 
 
