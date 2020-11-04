@@ -1,5 +1,8 @@
+import cProfile
+import sys
 from numpy import random as rnd
 import numpy as np
+import cupy as cp
 from scipy.io import loadmat
 
 from pymanopt.manifolds.doublystochastic import DoublyStochastic, SKnopp
@@ -9,11 +12,11 @@ from pymanopt import function
 
 from IPython import embed
 
-def test_doublystochastic():
+def test_doublystochastic(N, M, K):
     rnd.seed(21)
 
-    ns = [1000] * 100
-    ms = [1000] * 100
+    ns = [N] * K
+    ms = [M] * K
     batch = len(ns)
 
     p = []
@@ -41,7 +44,7 @@ def test_doublystochastic():
         return u
 
     manf = DoublyStochastic(n, m, p, q)
-    solver = ConjugateGradient(maxiter=5, maxtime=100000)
+    solver = ConjugateGradient(maxiter=3, maxtime=100000)
     prblm = Problem(manifold=manf, cost=lambda x: _cost(x), egrad=lambda x: _egrad(x), ehess=lambda x, u: _ehess(x, u), verbosity=3)
 
     U = manf.rand()
@@ -62,4 +65,5 @@ Col constraint err: {np.linalg.norm(np.sum(Uopt, axis=2) - p)}
 
 
 if __name__ == "__main__":
-    test_doublystochastic()
+    n, m, k = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+    test_doublystochastic(n, m, k)

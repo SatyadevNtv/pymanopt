@@ -53,18 +53,18 @@ def SKnopp(A, p, q, maxiters=None, checkperiod=None):
         d1 = q / proc.sum(C, axis=1)
 
     if C.ndim < 3:
-        d2 = p / proc.einsum('nm,bm->bn', C, d1.conj(), dtype='float')
+        d2 = p / d1.dot(C.T)
     else:
-        d2 = p / proc.einsum('bnm,bm->bn', C, d1.conj(), dtype='float')
+        d2 = p / proc.sum(C * d1[:, proc.newaxis, :], axis=2)
 
     gap = proc.inf
 
     iters = 0
     while iters < maxiters:
         if C.ndim < 3:
-            row = proc.einsum('bn,nm->bm', d2, C, dtype='float')
+            row = d2.dot(C)
         else:
-            row = proc.einsum('bn,bnm->bm', d2, C, dtype='float')
+            row = proc.sum(C * d2[:, :, proc.newaxis], axis=1)
 
         if iters % checkperiod == 0:
             gap = proc.max(proc.absolute(row * d1 - q))
@@ -76,9 +76,9 @@ def SKnopp(A, p, q, maxiters=None, checkperiod=None):
         d2_prev = d2
         d1 = q / row
         if C.ndim < 3:
-            d2 = p / proc.einsum('nm,bm->bn', C, d1.conj(), dtype='float')
+            d2 = p / d1.dot(C.T)
         else:
-            d2 = p / proc.einsum('bnm,bm->bn', C, d1.conj(), dtype='float')
+            d2 = p / proc.sum(C * d1[:, proc.newaxis, :], axis=2)
 
         if proc.any(proc.isnan(d1)) or proc.any(proc.isinf(d1)) or proc.any(proc.isnan(d2)) or proc.any(proc.isinf(d2)):
             warnings.warn("""SKnopp: NanInfEncountered
@@ -170,8 +170,8 @@ class DoublyStochastic(Manifold):
         v = v.reshape(self._k, int(v.shape[0]/self._k))
         vtop = proc.array(v[:, :self._n])
         vbottom = proc.array(v[:, self._n:])
-        Avtop = (vtop * self._p) + proc.einsum('bnm,bm->bn', self.X, vbottom, dtype='float')
-        Avbottom = proc.einsum('bnm,bn->bm', self.X, vtop, dtype='float') + (vbottom * self._q)
+        Avtop = (vtop * self._p) + proc.sum(self.X * vbottom[:, proc.newaxis, :], axis=2)
+        Avbottom = proc.sum(self.X * vtop[:, :, proc.newaxis], axis=1) + (vbottom * self._q)
         Av = proc.hstack((Avtop, Avbottom))
         return convert2numpy(Av.ravel())
 
