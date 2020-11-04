@@ -9,13 +9,11 @@ from pymanopt import function
 
 from IPython import embed
 
-import cupy as cp
-
 def test_doublystochastic():
     rnd.seed(21)
 
-    ns = [100] * 1000
-    ms = [200] * 1000
+    ns = [1000] * 100
+    ms = [1000] * 100
     batch = len(ns)
 
     p = []
@@ -29,12 +27,12 @@ def test_doublystochastic():
         q.append(q0 / np.sum(q0))
         A0 = rnd.rand(n, m)
         A0 = A0[np.newaxis, :]
-        A0 = SKnopp(A0, p[i], q[i], n+m).get()
+        A0 = SKnopp(A0, p[i], q[i], n+m)
         A.append(A0)
     A = np.vstack((C for C in A))
 
     def _cost(x):
-        return 0.5 * (cp.linalg.norm(cp.array(x) - cp.array(A))**2)
+        return 0.5 * (np.linalg.norm(np.array(x) - np.array(A))**2)
 
     def _egrad(x):
         return x - A
@@ -43,7 +41,7 @@ def test_doublystochastic():
         return u
 
     manf = DoublyStochastic(n, m, p, q)
-    solver = ConjugateGradient(maxiter=50, maxtime=100000)
+    solver = ConjugateGradient(maxiter=5, maxtime=100000)
     prblm = Problem(manifold=manf, cost=lambda x: _cost(x), egrad=lambda x: _egrad(x), ehess=lambda x, u: _ehess(x, u), verbosity=3)
 
     U = manf.rand()
