@@ -4,8 +4,9 @@ from numpy import random as rnd
 import numpy as np
 import cupy as cp
 from scipy.io import loadmat
+from scipy.sparse import csr_matrix, linalg as splg
 
-from pymanopt.manifolds.doublystochastic import DoublyStochastic, SKnopp
+from pymanopt.manifolds.doublystochastic import DoublyStochastic, SKnopp, SparseSKnopp
 from pymanopt.solvers import ConjugateGradient, TrustRegions
 from pymanopt import Problem
 from pymanopt import function
@@ -19,9 +20,13 @@ def test_doublystochastic(N, M, K):
     ms = [M] * K
     batch = len(ns)
 
+    # Sparse support.
+    # 0's point to the constraint
+    H = csr_matrix(np.eye(N, M))
+
     p = []
     q = []
-    A = []
+    A = None
     for i in range(batch):
         n, m = ns[i], ms[i]
         p0 = np.random.rand(n)
@@ -29,13 +34,12 @@ def test_doublystochastic(N, M, K):
         p.append(p0 / np.sum(p0))
         q.append(q0 / np.sum(q0))
         A0 = rnd.rand(n, m)
-        A0 = A0[np.newaxis, :]
-        A0 = SKnopp(A0, p[i], q[i], n+m)
-        A.append(A0)
-    A = np.vstack((C for C in A))
+        A0 = SparseSKnopp(H.multiply(A0), p[i], q[i], n+m)
+        A = A0
 
     def _cost(x):
-        return 0.5 * (np.linalg.norm(np.array(x) - np.array(A))**2)
+        result = 0.5 * (splg.norm(np.array(x) - np.array(A))**2)
+        return result
 
     def _egrad(x):
         return x - A
@@ -43,25 +47,18 @@ def test_doublystochastic(N, M, K):
     def _ehess(x, u):
         return u
 
-    manf = DoublyStochastic(n, m, p, q)
+    manf = DoublyStochastic(n, m, p, q, spr_mask=H)
     solver = ConjugateGradient(maxiter=3, maxtime=100000)
     prblm = Problem(manifold=manf, cost=lambda x: _cost(x), egrad=lambda x: _egrad(x), ehess=lambda x, u: _ehess(x, u), verbosity=3)
 
     U = manf.rand()
-    Uopt = solver.solve(prblm, x=U)
+    Uopt = np.array(solver.solve(prblm, x=U).todense())
     print(f"""
 For all
-Row constraint err: {np.linalg.norm(np.sum(Uopt, axis=1) - q)}
-Col constraint err: {np.linalg.norm(np.sum(Uopt, axis=2) - p)}
+Row constraint err: {np.linalg.norm(np.sum(Uopt, axis=0) - q[0])}
+Col constraint err: {np.linalg.norm(np.sum(Uopt, axis=1) - p[0])}
 
     """)
-    #for i in range(batch):
-    #    print(f"""
-    #For {i}
-    #Row constraint err: {np.linalg.norm(np.sum(Uopt[i], axis=0) - q[i])}
-    #Col constraint err: {np.linalg.norm(np.sum(Uopt[i], axis=1) - p[i])}
-
-    #    """)
 
 
 if __name__ == "__main__":

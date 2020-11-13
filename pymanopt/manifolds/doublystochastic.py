@@ -1,6 +1,7 @@
 import warnings
 
 from scipy.linalg import expm
+from scipy.sparse import issparse
 from scipy.sparse.linalg import LinearOperator, cg
 # Workaround for SciPy bug: https://github.com/scipy/scipy/pull/8082
 try:
@@ -24,6 +25,43 @@ if not gpu_opt:
 else:
     import cupy as proc
     from cupy import random as rnd
+
+def SparseSKnopp(A, p, q, maxiters=None, checkperiod=None):
+    assert issparse(A) and A.ndim == 2
+    tol = proc.finfo(float).eps
+    if maxiters is None:
+        maxiters = A.shape[0]*A.shape[1]
+    if checkperiod is None:
+        checkperiod = 10
+
+    C = A
+
+    d1 = q / proc.squeeze(proc.array(proc.sum(C, axis=0)))[proc.newaxis, :]
+    d2 = p / C.dot(d1.T).T
+
+    iters = 0
+    while iters < maxiters:
+        row = C.T.dot(d2.T).T
+
+        if iters % checkperiod == 0:
+            gap = proc.max(proc.absolute(row * d1 - q))
+            if proc.any(proc.isnan(gap)) or gap <= tol:
+                break
+        d1_prev = d1
+        d2_prev = d2
+        d1 = q / row
+        d2 = p / C.dot(d1.T).T
+        if proc.any(proc.isnan(d1)) or proc.any(proc.isinf(d1)) or proc.any(proc.isnan(d2)) or proc.any(proc.isinf(d2)):
+            warnings.warn("""SKnopp: NanInfEncountered
+                    Nan or Inf occured at iter {:d} \n""".format(iters))
+            embed()
+            d1 = d1_prev
+            d2 = d2_prev
+            break
+        iters+=1
+
+    return C.multiply(proc.outer(d2, d1))
+
 
 def SKnopp(A, p, q, maxiters=None, checkperiod=None):
     # TODO: Modify and optimize for "same marginals" case
@@ -97,7 +135,7 @@ class DoublyStochastic(Manifold):
     Implementation is based on multinomialdoublystochasticgeneralfactory.m
     """
 
-    def __init__(self, n, m, p=None, q=None, maxSKnoppIters=None):
+    def __init__(self, n, m, p=None, q=None, maxSKnoppIters=None, spr_mask=None):
         self._n = n
         self._m = m
         self._p = proc.array(p)
@@ -110,17 +148,26 @@ class DoublyStochastic(Manifold):
         if q is None:
             self._q = proc.repeat(1/m, m)
 
-        if self._p.ndim < 2 and self._q.ndim < 2:
-            self._p = self._p[proc.newaxis, :]
-            self._q = self._q[proc.newaxis, :]
+        if spr_mask is not None:
+            self._H = spr_mask
+            assert self._p.ndim == 2
+            assert self._q.ndim == 2
+            self._k = 1
+            self._name = ("{:d} {:d}X{:d} matrices with positive entries such that row sum is p and column sum is q respectively and has a sparse support.".format(self._k, n, m))
+            self.SKnopp = SparseSKnopp
+
+        else:
+            if self._p.ndim < 2 and self._q.ndim < 2:
+                self._p = self._p[proc.newaxis, :]
+                self._q = self._q[proc.newaxis, :]
+            # `k` doublystochastic manifolds
+            self._k = self._p.shape[0]
+            self._name = ("{:d} {:d}X{:d} matrices with positive entries such that row sum is p and column sum is q respectively.".format(self._k, n, m))
+            self.SKnopp = SKnopp
+
 
         if maxSKnoppIters is None:
             self._maxSKnoppIters = min(2000, 100 + m + n)
-
-        # `k` doublystochastic manifolds
-        self._k = self._p.shape[0]
-
-        self._name = ("{:d} {:d}X{:d} matrices with positive entries such that row sum is p and column sum is q respectively.".format(len(p), n, m))
 
         self._dim = self._k * (self._n - 1)*(self._m - 1)
         self._e1 = proc.ones(n)
@@ -142,11 +189,13 @@ class DoublyStochastic(Manifold):
 
 
     def inner(self, x, u, v):
-        x = proc.array(x)
-        u = proc.array(u)
-        v = proc.array(v)
-
-        return convert2numpy(proc.sum(u * v/ x))
+        x, u, v = self._validate(x, u, v)
+        num = self._multiply(u, v)
+        if self._H is not None:
+            result = proc.sum(self._H.multiply(num / x))
+        else:
+            result = proc.sum(num / x)
+        return convert2numpy(result)
 
 
     def norm(self, x, u):
@@ -155,7 +204,8 @@ class DoublyStochastic(Manifold):
 
     def rand(self):
         Z = proc.absolute(rnd.randn(self._n, self._m))
-        return SKnopp(Z, self._p, self._q, self._maxSKnoppIters)
+        Z = self._multiply(self._H, Z)
+        return self.SKnopp(Z, self._p, self._q, self._maxSKnoppIters)
 
 
     def randvec(self, x):
@@ -166,12 +216,11 @@ class DoublyStochastic(Manifold):
 
 
     def _matvec(self, v):
-        self._k = int(self.X.shape[0])
         v = v.reshape(self._k, int(v.shape[0]/self._k))
         vtop = proc.array(v[:, :self._n])
         vbottom = proc.array(v[:, self._n:])
-        Avtop = (vtop * self._p) + proc.sum(self.X * vbottom[:, proc.newaxis, :], axis=2)
-        Avbottom = proc.sum(self.X * vtop[:, :, proc.newaxis], axis=1) + (vbottom * self._q)
+        Avtop = (vtop * self._p) + proc.sum(self._multiply(self.X, vbottom[:, proc.newaxis, :]), axis=2)
+        Avbottom = proc.sum(self._multiply(self.X, vtop[:, :, proc.newaxis]), axis=1) + (vbottom * self._q)
         Av = proc.hstack((Avtop, Avbottom))
         return convert2numpy(Av.ravel())
 
@@ -189,10 +238,19 @@ class DoublyStochastic(Manifold):
 
 
     def proj(self, x, v):
-        assert v.ndim == 3
-        b = proc.hstack((proc.sum(v, axis=2), proc.sum(v, axis=1)))
+        # TODO: Use a decorator to abstact this out.
+        x, v = self._validate(x, v)
+        if self._H is None:
+            assert v.ndim == 3
+            b = proc.hstack((proc.sum(v, axis=2), proc.sum(v, axis=1)))
+        else:
+            assert v.ndim == 2
+            b = proc.hstack((proc.array(proc.sum(v, axis=1)).squeeze(), proc.array(proc.sum(v, axis=0)).squeeze()))
         alpha, beta = self._lsolve(x, b.ravel())
-        result = v - (proc.einsum('bn,m->bnm', alpha, self._e2, dtype='float') + proc.einsum('n,bm->bnm', self._e1, beta, dtype='float'))*x
+        if self._H is None:
+            result = v - (proc.einsum('bn,m->bnm', alpha, self._e2, dtype='float') + proc.einsum('n,bm->bnm', self._e1, beta, dtype='float'))*x
+        else:
+            result = v - x.multiply(proc.einsum('n,m->nm', proc.array(alpha).squeeze(), self._e2, dtype='float') + proc.einsum('n,m->nm', self._e1, proc.array(beta).squeeze(), dtype='float'))
         return result
 
 
@@ -201,13 +259,16 @@ class DoublyStochastic(Manifold):
 
 
     def egrad2rgrad(self, x, u):
-        x = proc.array(x)
-        u = proc.array(u)
-        mu = x * u
+        x, u = self._validate(x, u)
+
+        mu = self._multiply(x, u)
+
         return convert2numpy(self.proj(x, mu))
 
 
     def ehess2rhess(self, x, egrad, ehess, u):
+        if self._H is None:
+            raise RuntimeError
         x = proc.array(x)
         egrad = proc.array(egrad)
         ehess = proc.array(u)
@@ -240,13 +301,14 @@ class DoublyStochastic(Manifold):
 
 
     def retr(self, x, u):
-        x = proc.array(x)
-        u = proc.array(u)
+        x, u = self._validate(x, u)
 
-        Y = x * proc.exp(u/x)
-        Y = proc.maximum(Y, 1e-50)
-        Y = proc.minimum(Y, 1e50)
-        return SKnopp(Y, self._p, self._q, self._maxSKnoppIters)
+        if self._H is not None:
+            Y = self._multiply(x, proc.exp(self.H.multiply(u / x)))
+        else:
+            Y = self._multiply(x, proc.exp(u / x))
+
+        return self.SKnopp(Y, self._p, self._q, self._maxSKnoppIters)
 
 
     def zerovec(self, x):
@@ -254,12 +316,32 @@ class DoublyStochastic(Manifold):
 
 
     def transp(self, x1, x2, d):
-        x2 = proc.array(x2)
-        d = proc.array(d)
+        x1, x2, d = self._validate(x1, x2, d)
         return convert2numpy(self.proj(x2, d))
+
+
+    def _validate(self, *args):
+        vars = []
+        if self._H is None:
+            for arg in args:
+                assert not issparse(arg)
+                vars.append(proc.array(arg))
+        else:
+            for arg in args:
+                vars.append(self._H.multiply(arg))
+        return vars
+
+    def _multiply(self, a, b):
+        if self._H is None:
+            return a * b
+        else:
+            assert issparse(a)
+            return a.multiply(b)
 
 
 def convert2numpy(val):
     if gpu_opt:
         return val.get()
+    if issparse(val):
+        return val.todense()
     return val
